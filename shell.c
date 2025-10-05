@@ -321,6 +321,28 @@ int builtin_pwd(int argc, char *argv[]) {
   return 0;
 }
 
+int builtin_echo(int argc, char *argv[]) {
+  for (int i = 1; i < argc; i++) {
+    char *arg = argv[i];
+
+    // Strip surrounding quotes if they match
+    size_t len = strlen(arg);
+    if (len >= 2 && ((arg[0] == '"' && arg[len - 1] == '"') ||
+                     (arg[0] == '\'' && arg[len - 1] == '\''))) {
+      // Print without surrounding quotes
+      printf("%.*s", (int)(len - 2), arg + 1);
+    } else {
+      printf("%s", arg);
+    }
+
+    if (i < argc - 1) {
+      printf(" ");
+    }
+  }
+  printf("\n");
+  return 0;
+}
+
 static int try_builtin(size_t argc, char *argv[]) {
   if (argc == 0)
     return 1; // nothing to do, but "handled"
@@ -354,6 +376,10 @@ static int try_builtin(size_t argc, char *argv[]) {
   }
   if (strcmp(argv[0], "bg") == 0) {
     last_status = builtin_bg((int)argc, argv);
+    return 1;
+  }
+  if (strcmp(argv[0], "echo") == 0) {
+    last_status = builtin_echo((int)argc, argv);
     return 1;
   }
 
@@ -589,9 +615,79 @@ int main(int argc, char **argv) {
     if (line[0] == '\0') {
       continue;
     }
-
+    // this is so we can handle && // and other operators
     add_to_history(line);
-    execute_command(line);
+
+    // Handle &&, ||, ;
+    char *cmd_copy = strdup(line);
+    char *cmds[MAX_ARGS];
+    char ops[MAX_ARGS];
+    int cmd_count = 0;
+
+    char *current = cmd_copy;
+    char *next;
+
+    while (current && *current) {
+      // Find next operator
+      char *and_op = strstr(current, "&&");
+      char *or_op = strstr(current, "||");
+      char *semi_op = strchr(current, ';');
+
+      next = NULL;
+      char op = '\0';
+
+      // Find earliest operator
+      if (and_op && (!next || and_op < next)) {
+        next = and_op;
+        op = '&';
+      }
+      if (or_op && (!next || or_op < next)) {
+        next = or_op;
+        op = '|';
+      }
+      if (semi_op && (!next || semi_op < next)) {
+        next = semi_op;
+        op = ';';
+      }
+
+      if (next) {
+        *next = '\0';
+        cmds[cmd_count] = current;
+        ops[cmd_count] = op;
+        cmd_count++;
+
+        if (op == ';') {
+          current = next + 1;
+        } else {
+          current = next + 2;
+        }
+
+        // Skip whitespace
+        while (*current == ' ' || *current == '\t')
+          current++;
+      } else {
+        cmds[cmd_count] = current;
+        ops[cmd_count] = '\0';
+        cmd_count++;
+        break;
+      }
+    }
+
+    // Execute commands with operators
+    for (int i = 0; i < cmd_count; i++) {
+      execute_command(cmds[i]);
+
+      if (i < cmd_count - 1) {
+        if (ops[i] == '&' && last_status != 0) {
+          break; // && failed, skip rest
+        } else if (ops[i] == '|' && last_status == 0) {
+          break; // || succeeded, skip rest
+        }
+        // ; always continues
+      }
+    }
+
+    free(cmd_copy);
   }
 
   return 0;
