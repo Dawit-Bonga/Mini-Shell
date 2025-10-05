@@ -360,13 +360,105 @@ static int try_builtin(size_t argc, char *argv[]) {
   return 0; // not a built-in
 }
 
+int execute_pipeline(char *commands[], int num_commands, int background) {
+  int pipes[num_commands - 1][2];
+  pid_t pids[num_commands];
+
+  for (int i = 0; i < num_commands - 1; i++) {
+    if (pipe(pipes[i]) < 0) {
+      perror("pipe");
+      return 1;
+    }
+  }
+
+  for (int i = 0; i < num_commands; i++) {
+    char *args[MAX_ARGS];
+    int count = 0;
+    char *token = strtok(commands[i], " \t");
+    while (token && count < MAX_ARGS - 1) {
+      args[count++] = token;
+      token = strtok(NULL, " \t");
+    }
+    args[count] = NULL;
+
+    if (count == 0) {
+      continue;
+    }
+
+    pids[i] = fork();
+    if (pids[i] < 0) {
+      perror("fork");
+      return 1;
+    }
+
+    if (pids[i] == 0) {
+      signal(SIGINT, SIG_DFL);
+      signal(SIGTSTP, SIG_DFL);
+
+      if (i > 0) {
+        dup2(pipes[i - 1][0], STDIN_FILENO);
+      }
+
+      if (i < num_commands - 1) {
+        dup2(pipes[i][1], STDOUT_FILENO);
+      }
+
+      for (int j = 0; j < num_commands - 1; j++) {
+        close(pipes[j][0]);
+        close(pipes[j][1]);
+      }
+
+      execvp(args[0], args);
+      fprintf(stderr,
+              "mini-shell>Command not found--Did you mean something else?\n");
+      _exit(127);
+    }
+  }
+
+  for (int i = 0; i < num_commands - 1; i++) {
+    close(pipes[i][0]);
+    close(pipes[i][1]);
+  }
+  // Wait or track background
+  if (!background) {
+    for (int i = 0; i < num_commands; i++) {
+      int status;
+      fg_pid = pids[i];
+      waitpid(pids[i], &status, WUNTRACED);
+      fg_pid = 0;
+
+      if (WIFEXITED(status)) {
+        last_status = WEXITSTATUS(status);
+      } else if (WIFSIGNALED(status)) {
+        last_status = 128 + WTERMSIG(status);
+      } else if (WIFSTOPPED(status)) {
+        add_job(pids[i], commands[i], JOB_STOPPED);
+        printf("\n[%d]+ Stopped                 %s\n",
+               jobs[job_count - 1].job_id, commands[i]);
+      }
+    }
+  } else {
+    char full_cmd[LINE_MAX + 1] = "";
+    for (int i = 0; i < num_commands; i++) {
+      if (i > 0)
+        strcat(full_cmd, " | ");
+      strcat(full_cmd, commands[i]);
+    }
+    add_job(pids[num_commands - 1], full_cmd, JOB_RUNNING);
+    printf("[%d] %d\n", jobs[job_count - 1].job_id, pids[num_commands - 1]);
+  }
+
+  return 0;
+}
+
 int execute_command(char *cmd_line) {
-  // Check for background
+  // STEP 1: Check for background and remove '&'
   int background = 0;
   size_t len = strlen(cmd_line);
   if (len > 0 && cmd_line[len - 1] == '&') {
     background = 1;
     cmd_line[len - 1] = '\0';
+    len--;
     // Trim trailing spaces
     while (len > 1 && (cmd_line[len - 2] == ' ' || cmd_line[len - 2] == '\t')) {
       cmd_line[len - 2] = '\0';
@@ -374,10 +466,34 @@ int execute_command(char *cmd_line) {
     }
   }
 
-  // Parse command (no pipes for now)
+  // STEP 2: SAVE THE CLEANED COMMAND BEFORE ANY strtok!
+  char original_cmd[LINE_MAX + 1];
+  strncpy(original_cmd, cmd_line, LINE_MAX);
+  original_cmd[LINE_MAX] = '\0';
+
+  // STEP 3: Check for pipes (this uses strtok_r which also modifies cmd_line)
+  char *pipe_cmds[MAX_ARGS];
+  int num_pipes = 0;
+  char *saveptr;
+  char *token = strtok_r(cmd_line, "|", &saveptr);
+  while (token && num_pipes < MAX_ARGS) {
+    // Trim leading/trailing spaces
+    while (*token == ' ' || *token == '\t')
+      token++;
+    pipe_cmds[num_pipes++] = token;
+    token = strtok_r(NULL, "|", &saveptr);
+  }
+
+  if (num_pipes > 1) {
+    return execute_pipeline(pipe_cmds, num_pipes, background);
+  }
+
+  // STEP 4: Parse single command
+  // cmd_line is already tokenized by the pipe check above, so re-parse from
+  // pipe_cmds[0]
   char *args[MAX_ARGS];
   size_t count = 0;
-  char *token = strtok(cmd_line, " \t");
+  token = strtok(pipe_cmds[0], " \t");
   while (token && count < MAX_ARGS - 1) {
     args[count++] = token;
     token = strtok(NULL, " \t");
@@ -417,27 +533,13 @@ int execute_command(char *cmd_line) {
       } else if (WIFSIGNALED(status)) {
         last_status = 128 + WTERMSIG(status);
       } else if (WIFSTOPPED(status)) {
-        add_job(pid, cmd_line, JOB_STOPPED);
+        add_job(pid, original_cmd, JOB_STOPPED);
         printf("\n[%d]+ Stopped                 %s\n",
-               jobs[job_count - 1].job_id, cmd_line);
+               jobs[job_count - 1].job_id, original_cmd);
       }
     } else {
-      add_job(pid, cmd_line, JOB_RUNNING);
+      add_job(pid, original_cmd, JOB_RUNNING);
       printf("[%d] %d\n", jobs[job_count - 1].job_id, pid);
-    }
-  }
-
-  return 0;
-}
-
-int execute_pipeline(char *commands[], int num_commands, int background) {
-  int pipes[num_commands - 1][2];
-  pid_t pids[num_commands];
-
-  for (int i = 0; i < num_commands - 1; i++) {
-    if (pipe(pipes[i]) < 0) {
-      perror("pipe");
-      return 1;
     }
   }
 
