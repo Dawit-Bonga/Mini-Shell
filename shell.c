@@ -1,16 +1,20 @@
 // Implement your shell in this source file.
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/_types/_pid_t.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LINE_MAX 80
+#define LINE_MAX 81
 int last_status = 0;
 #define MAX_HISTORY 80
+#define MAX_JOBS 5
+#define MAX_ARGS 64
 // static int next_job_id = 1;
 
 typedef struct {
@@ -30,6 +34,7 @@ pid_t fg_pid = 0;
 
 job_t jobs[5];
 int job_count = 0;
+static int next_job_id = 1;
 
 void add_to_history(const char *cmd) {
   if (history_count < MAX_HISTORY) {
@@ -78,6 +83,181 @@ void my_signal_handler(int sig) {
     // child changed state; do real work outside the handler
     have_zombies = 1;
   }
+}
+
+void cleanup_finished_jobs() {
+  if (!have_zombies) {
+    return;
+  }
+  have_zombies = 0;
+
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+    for (int i = 0; i < job_count; i++) {
+      if (jobs[i].pid == pid) {
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+          jobs[i].status = JOB_DONE;
+          printf("\n[%d]+ Done                    %s\n", jobs[i].job_id,
+                 jobs[i].command);
+        } else if (WIFSTOPPED(status)) {
+          jobs[i].status = JOB_STOPPED;
+          printf("\n[%d]+ Stopped                 %s\n", jobs[i].job_id,
+                 jobs[i].command);
+        } else if (WIFCONTINUED(status)) {
+          jobs[i].status = JOB_RUNNING;
+        }
+        break;
+      }
+    }
+  }
+}
+
+void add_job(pid_t pid, char *command, int status) {
+  if (job_count >= MAX_JOBS) {
+    int j = 0;
+    for (int i = 0; i < job_count; i++) {
+      if (jobs[i].status != JOB_DONE) {
+        if (i != j) {
+          jobs[j] = jobs[i];
+        }
+        j++;
+      }
+    }
+    job_count = j;
+  }
+
+  if (job_count < MAX_JOBS) {
+    jobs[job_count].pid = pid;
+    strncpy(jobs[job_count].command, command, LINE_MAX);
+    jobs[job_count].command[LINE_MAX - 1] = '\0';
+    jobs[job_count].job_id = next_job_id++;
+    jobs[job_count].status = status;
+    job_count++;
+  }
+}
+
+int builtin_jobs(int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+  for (int i = 0; i < job_count; i++) {
+    char *status_str = NULL;
+    switch (jobs[i].status) {
+    case JOB_RUNNING:
+      status_str = "Running";
+      break;
+    case JOB_STOPPED:
+      status_str = "Stopped";
+      break;
+    case JOB_DONE:
+      continue;
+    }
+    printf("[%d]+ %-20s %s\n", jobs[i].job_id, status_str, jobs[i].command);
+  }
+  return 0;
+}
+
+int builtin_fg(int argc, char *argv[]) {
+  int job_num = -1;
+
+  if (argc >= 2) {
+    job_num = atoi(argv[1]);
+  } else {
+    // Use most recent job
+    for (int i = job_count - 1; i >= 0; i--) {
+      if (jobs[i].status != JOB_DONE) {
+        job_num = jobs[i].job_id;
+        break;
+      }
+    }
+  }
+
+  if (job_num == -1) {
+    fprintf(stderr, "fg: no current job\n");
+    return 1;
+  }
+
+  int job_idx = -1;
+  for (int i = 0; i < job_count; i++) {
+    if (jobs[i].job_id == job_num) {
+      job_idx = i;
+      break;
+    }
+  }
+
+  if (job_idx == -1) {
+    fprintf(stderr, "fg: job %d not found\n", job_num);
+    return 1;
+  }
+
+  pid_t pid = jobs[job_idx].pid;
+  fg_pid = pid;
+
+  // Continue the process if stopped
+  if (jobs[job_idx].status == JOB_STOPPED) {
+    kill(pid, SIGCONT);
+  }
+
+  jobs[job_idx].status = JOB_RUNNING;
+  printf("%s\n", jobs[job_idx].command);
+
+  // Wait for it
+  int status;
+  waitpid(pid, &status, WUNTRACED);
+  fg_pid = 0;
+
+  if (WIFEXITED(status)) {
+    last_status = WEXITSTATUS(status);
+    jobs[job_idx].status = JOB_DONE;
+  } else if (WIFSIGNALED(status)) {
+    last_status = 128 + WTERMSIG(status);
+    jobs[job_idx].status = JOB_DONE;
+  } else if (WIFSTOPPED(status)) {
+    jobs[job_idx].status = JOB_STOPPED;
+    printf("\n[%d]+ Stopped                 %s\n", jobs[job_idx].job_id,
+           jobs[job_idx].command);
+  }
+
+  return 0;
+}
+
+int builtin_bg(int argc, char *argv[]) {
+  int job_num = -1;
+
+  if (argc >= 2) {
+    job_num = atoi(argv[1]);
+  } else {
+    for (int i = job_count - 1; i >= 0; i--) {
+      if (jobs[i].status == JOB_STOPPED) {
+        job_num = jobs[i].job_id;
+        break;
+      }
+    }
+  }
+
+  if (job_num == -1) {
+    fprintf(stderr, "bg: no stopped job\n");
+    return 1;
+  }
+
+  int job_idx = -1;
+  for (int i = 0; i < job_count; i++) {
+    if (jobs[i].job_id == job_num) {
+      job_idx = i;
+      break;
+    }
+  }
+
+  if (job_idx == -1 || jobs[job_idx].status != JOB_STOPPED) {
+    fprintf(stderr, "bg: job %d did not get stopped\n", job_num);
+    return 1;
+  }
+
+  kill(jobs[job_idx].pid, SIGCONT);
+  jobs[job_idx].status = JOB_RUNNING;
+  printf("[%d]+ %s &\n", jobs[job_idx].job_id, jobs[job_idx].command);
+
+  return 0;
 }
 
 static int builtin_help(int argc, char *argv[]) {
@@ -160,31 +340,114 @@ static int try_builtin(size_t argc, char *argv[]) {
     last_status = builtin_help((int)argc, argv);
     return 1;
   }
-  // Stubs for assignment completeness; not implemented here
+  if (strcmp(argv[0], "history") == 0) {
+    last_status = builtin_history((int)argc, argv);
+    return 1;
+  }
   if (strcmp(argv[0], "jobs") == 0) {
-    puts("(jobs not implemented yet)");
-    last_status = 0;
+    last_status = builtin_jobs((int)argc, argv);
     return 1;
   }
   if (strcmp(argv[0], "fg") == 0) {
-    puts("(fg not implemented yet)");
-    last_status = 0;
+    last_status = builtin_fg((int)argc, argv);
     return 1;
   }
   if (strcmp(argv[0], "bg") == 0) {
-    puts("(bg not implemented yet)");
-    last_status = 0;
-    return 1;
-  }
-  if (strcmp(argv[0], "history") == 0) {
-    last_status = builtin_history((int)argc, argv);
+    last_status = builtin_bg((int)argc, argv);
     return 1;
   }
 
   return 0; // not a built-in
 }
 
+int execute_command(char *cmd_line) {
+  // Check for background
+  int background = 0;
+  size_t len = strlen(cmd_line);
+  if (len > 0 && cmd_line[len - 1] == '&') {
+    background = 1;
+    cmd_line[len - 1] = '\0';
+    // Trim trailing spaces
+    while (len > 1 && (cmd_line[len - 2] == ' ' || cmd_line[len - 2] == '\t')) {
+      cmd_line[len - 2] = '\0';
+      len--;
+    }
+  }
+
+  // Parse command (no pipes for now)
+  char *args[MAX_ARGS];
+  size_t count = 0;
+  char *token = strtok(cmd_line, " \t");
+  while (token && count < MAX_ARGS - 1) {
+    args[count++] = token;
+    token = strtok(NULL, " \t");
+  }
+  args[count] = NULL;
+
+  if (count == 0)
+    return 0;
+
+  if (try_builtin(count, args)) {
+    return 0;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    return 1;
+  }
+
+  if (pid == 0) {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+
+    execvp(args[0], args);
+    fprintf(stderr,
+            "mini-shell>Command not found--Did you mean something else?\n");
+    _exit(127);
+  } else {
+    if (!background) {
+      int status;
+      fg_pid = pid;
+      waitpid(pid, &status, WUNTRACED);
+      fg_pid = 0;
+
+      if (WIFEXITED(status)) {
+        last_status = WEXITSTATUS(status);
+      } else if (WIFSIGNALED(status)) {
+        last_status = 128 + WTERMSIG(status);
+      } else if (WIFSTOPPED(status)) {
+        add_job(pid, cmd_line, JOB_STOPPED);
+        printf("\n[%d]+ Stopped                 %s\n",
+               jobs[job_count - 1].job_id, cmd_line);
+      }
+    } else {
+      add_job(pid, cmd_line, JOB_RUNNING);
+      printf("[%d] %d\n", jobs[job_count - 1].job_id, pid);
+    }
+  }
+
+  return 0;
+}
+
+int execute_pipeline(char *commands[], int num_commands, int background) {
+  int pipes[num_commands - 1][2];
+  pid_t pids[num_commands];
+
+  for (int i = 0; i < num_commands - 1; i++) {
+    if (pipe(pipes[i]) < 0) {
+      perror("pipe");
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  (void)argc; // Suppress unused parameter warning
+  (void)argv;
+
   // Please leave in this line as the first statement in your program.
   alarm(120); // This will terminate your shell after 120 seconds,
               // and is useful in the case that you accidently create a 'fork
@@ -196,10 +459,14 @@ int main(int argc, char **argv) {
   // Avoid the shell itself being stopped by terminal I/O signals
   signal(SIGTTOU, SIG_IGN);
   signal(SIGTTIN, SIG_IGN);
+  signal(SIGTSTP, SIG_IGN); // <-- ADD THIS! Prevents shell from being stopped
+
   char line[LINE_MAX + 2];
   int interactive = isatty(STDIN_FILENO);
 
   for (;;) { // infinite loop
+    cleanup_finished_jobs();
+
     if (interactive) {
       fputs("mini-shell> ", stdout);
       fflush(stdout);
@@ -221,59 +488,9 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    if (line[0] != '\0') {
-      add_to_history(line);
-    }
-
-    char *args[64];
-    size_t count = 0; // num of tokens kinda
-    char *token = strtok(line, " \t");
-    while (token && count < 63) {
-      args[count++] = token;
-      token = strtok(NULL, " \t");
-    }
-
-    args[count] = NULL;
-
-    if (try_builtin(count, args)) {
-      continue;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-      perror("fork");
-      last_status = 1;
-      continue;
-    }
-
-    if (pid == 0) {
-      // CHILD: restore default handling so Ctrl-C/Z affect the child, not
-      // shell
-      signal(SIGINT, SIG_DFL);
-      signal(SIGTSTP, SIG_DFL);
-
-      execvp(args[0], args); // search PATH and exec
-      // If we’re here, exec failed
-      fprintf(stderr,
-              "mini-shell>Command not found--Did you mean something else?\n");
-      _exit(127);
-    } else {
-      // PARENT: wait for the child to finish (or be stopped)
-      int status = 0;
-      if (waitpid(pid, &status, WUNTRACED) < 0) {
-        last_status = 1;
-        continue;
-      }
-
-      if (WIFEXITED(status)) {
-        last_status = WEXITSTATUS(status);
-      } else if (WIFSIGNALED(status)) {
-        last_status = 128 + WTERMSIG(status); // shell convention
-      } else if (WIFSTOPPED(status)) {
-        // For now (pre-jobs), treat a stop like a signal status
-        last_status = 128 + WSTOPSIG(status);
-      }
-    }
+    add_to_history(line);
+    execute_command(line);
   }
+
   return 0;
 }
